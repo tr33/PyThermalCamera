@@ -29,6 +29,7 @@ import numpy as np
 import argparse
 import time
 import io
+import sys
 
 #We need to know if we are running on the Pi, because openCV behaves a little oddly on all the builds!
 #https://raspberrypi.stackexchange.com/questions/5100/detect-that-a-python-program-is-running-on-the-pi
@@ -41,9 +42,32 @@ def is_raspberrypi():
 
 isPi = is_raspberrypi()
 
+def sizeArg(text):
+	#parse "WxH", e.g. 640x480
+	try:
+		w, h = (int(v) for v in text.lower().split('x'))
+	except ValueError:
+		raise argparse.ArgumentTypeError("expected WxH, e.g. 640x480")
+	if w < 16 or h < 16 or w % 2 or h % 2:
+		raise argparse.ArgumentTypeError("width and height must be even and at least 16")
+	return (w, h)
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--device", type=int, default=0, help="Video Device number e.g. 0, use v4l2-ctl --list-devices")
+parser.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270], help="Rotate image clockwise by 0, 90, 180 or 270 degrees")
+parser.add_argument("--vcam", nargs="?", const="auto", default=None, metavar="DEVICE", help="Also send the processed video to a v4l2loopback device (e.g. /dev/video10) so other programs can use it as a webcam. Without DEVICE the first free loopback device is used. Needs: pip install pyvirtualcam")
+parser.add_argument("--vcam-size", type=sizeArg, default=None, metavar="WxH", help="Output size of the virtual webcam, e.g. 640x480 or 1920x1080 (default: 1280x720). The image is scaled to fit and letterboxed, never stretched.")
 args = parser.parse_args()
+
+#optional rotation (image AND temperature data are rotated together)
+rotateCode = {0: None, 90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}[args.rotate]
+rotation = None
+if args.rotate == 90:
+  rotation = cv2.ROTATE_90_CLOCKWISE
+elif args.rotate == 180:
+  rotation = cv2.ROTATE_180
+elif args.rotate == 270:
+  rotation = cv2.ROTATE_90_COUNTERCLOCKWISE
 	
 if args.device:
 	dev = args.device
@@ -58,11 +82,28 @@ cap = cv2.VideoCapture('/dev/video'+str(dev), cv2.CAP_V4L)
 if isPi == True:
 	cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
 else:
-	cap.set(cv2.CAP_PROP_CONVERT_RGB, False)
+	cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
 
-#256x192 General settings
-width = 256 #Sensor width
-height = 192 #sensor height
+#General settings
+#sensor size: taken from the first frame (each frame = image on top + temperature data below)
+ret, frame = cap.read()
+if ret and frame is not None and frame.ndim == 3:
+	print('Camera frame: %dx%d pixels, %d channels (driver reports %dx%d)' % (frame.shape[1], frame.shape[0], frame.shape[2],
+		int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))))
+	width = frame.shape[1] #Sensor width
+	height = frame.shape[0]//2 #sensor height
+else:
+	width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) #Sensor width
+	height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))//2 #sensor height
+# if width <= 0 or height <= 0:
+	# width, height = 384, 384 #fallback if the camera does not report its size
+# width, height = 384, 384 #fallback if the camera does not report its size
+# width, height = width*2, height
+print('Sensor: %dx%d pixels' % (width, height))
+if rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE):
+	width, height = height, width
+#raw sensor value -> Celsius: raw/64 - tempOffset (original TC001: 273.15, adjusted for this camera)
+tempOffset = 475.15
 scale = 3 #scale multiplier
 newWidth = width*scale 
 newHeight = height*scale
@@ -72,6 +113,26 @@ font=cv2.FONT_HERSHEY_SIMPLEX
 dispFullscreen = False
 cv2.namedWindow('Thermal',cv2.WINDOW_GUI_NORMAL)
 cv2.resizeWindow('Thermal', newWidth,newHeight)
+
+#optional virtual webcam via v4l2loopback (fixed standard size, independent of the d/c scaling keys)
+vcam = None
+if args.vcam:
+	try:
+		import pyvirtualcam
+	except ImportError:
+		print('Error: --vcam needs the Python package pyvirtualcam:  pip install pyvirtualcam')
+		sys.exit(1)
+	vcamWidth, vcamHeight = args.vcam_size if args.vcam_size else (1280, 720) #standard webcam resolution
+	try:
+		vcam = pyvirtualcam.Camera(width=vcamWidth, height=vcamHeight, fps=25,
+			fmt=pyvirtualcam.PixelFormat.RGB, backend='v4l2loopback',
+			device=None if args.vcam == 'auto' else args.vcam)
+	except RuntimeError as e:
+		print('Error: could not open the virtual webcam:', e)
+		print('Is the v4l2loopback module loaded? e.g.:')
+		print('  sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="TC001 Thermal" exclusive_caps=1')
+		sys.exit(1)
+	print('Virtual webcam: %s (%dx%d @ 25 fps)' % (vcam.device, vcamWidth, vcamHeight))
 rad = 0 #blur radius
 threshold = 2
 hud = True
@@ -84,6 +145,20 @@ def rec():
 	#do NOT use mp4 here, it is flakey!
 	videoOut = cv2.VideoWriter(now+'output.avi', cv2.VideoWriter_fourcc(*'XVID'),25, (newWidth,newHeight))
 	return(videoOut)
+
+def fitToSize(img, outWidth, outHeight):
+	#Scale the image into outWidth x outHeight while keeping its aspect ratio (black bars, no stretching)
+	h, w = img.shape[:2]
+	if (w, h) == (outWidth, outHeight):
+		return img
+	f = min(outWidth / w, outHeight / h)
+	nw, nh = max(1, int(round(w * f))), max(1, int(round(h * f)))
+	interp = cv2.INTER_AREA if f < 1 else cv2.INTER_CUBIC
+	resized = cv2.resize(img, (nw, nh), interpolation=interp)
+	canvas = np.zeros((outHeight, outWidth) + img.shape[2:], dtype=img.dtype)
+	x0, y0 = (outWidth - nw) // 2, (outHeight - nh) // 2
+	canvas[y0:y0+nh, x0:x0+nw] = resized
+	return canvas
 
 def snapshot(heatmap):
 	#I would put colons in here, but it Win throws a fit if you try and open them!
@@ -98,56 +173,39 @@ while(cap.isOpened()):
 	ret, frame = cap.read()
 	if ret == True:
 		imdata,thdata = np.array_split(frame, 2)
+		if rotation is not None:
+			thdata = cv2.rotate(thdata, rotation)
+		thHeight, thWidth = thdata.shape[:2]
 		#now parse the data from the bottom frame and convert to temp!
 		#https://www.eevblog.com/forum/thermal-imaging/infiray-and-their-p2-pro-discussion/200/
 		#Huge props to LeoDJ for figuring out how the data is stored and how to compute temp from it.
+		#16 bit raw value per pixel: low byte in channel 0, high byte in channel 1
+		rawdata = thdata[...,0].astype(np.uint32) + thdata[...,1].astype(np.uint32)*256
+
 		#grab data from the center pixel...
-		hi = thdata[96][128][0]
-		lo = thdata[96][128][1]
-		#print(hi,lo)
-		lo = lo*256
-		rawtemp = hi+lo
-		#print(rawtemp)
-		temp = (rawtemp/64)-273.15
-		temp = round(temp,2)
-		#print(temp)
-		#break
+		rawtemp = int(rawdata[thHeight//2][thWidth//2])
+		temp = round((rawtemp/64)-tempOffset, 2)
 
 		#find the max temperature in the frame
-		lomax = thdata[...,1].max()
-		posmax = thdata[...,1].argmax()
+		posmax = int(rawdata.argmax())
 		#since argmax returns a linear index, convert back to row and col
-		mcol,mrow = divmod(posmax,width)
-		himax = thdata[mcol][mrow][0]
-		lomax=lomax*256
-		maxtemp = himax+lomax
-		maxtemp = (maxtemp/64)-273.15
-		maxtemp = round(maxtemp,2)
+		mcol,mrow = divmod(posmax,thWidth)
+		maxtemp = round((int(rawdata[mcol][mrow])/64)-tempOffset, 2)
 
-		
 		#find the lowest temperature in the frame
-		lomin = thdata[...,1].min()
-		posmin = thdata[...,1].argmin()
-		#since argmax returns a linear index, convert back to row and col
-		lcol,lrow = divmod(posmin,width)
-		himin = thdata[lcol][lrow][0]
-		lomin=lomin*256
-		mintemp = himin+lomin
-		mintemp = (mintemp/64)-273.15
-		mintemp = round(mintemp,2)
+		posmin = int(rawdata.argmin())
+		lcol,lrow = divmod(posmin,thWidth)
+		mintemp = round((int(rawdata[lcol][lrow])/64)-tempOffset, 2)
 
 		#find the average temperature in the frame
-		loavg = thdata[...,1].mean()
-		hiavg = thdata[...,0].mean()
-		loavg=loavg*256
-		avgtemp = loavg+hiavg
-		avgtemp = (avgtemp/64)-273.15
-		avgtemp = round(avgtemp,2)
+		avgtemp = round((float(rawdata.mean())/64)-tempOffset, 2)
 
 		
 
 		# Convert the real image to RGB
 		bgr = cv2.cvtColor(imdata,  cv2.COLOR_YUV2BGR_YUYV)
+		if rotation is not None:
+			bgr = cv2.rotate(bgr, rotation)
 		#Contrast
 		bgr = cv2.convertScaleAbs(bgr, alpha=alpha)#Contrast
 		#bicubic interpolate, upscale and blur
@@ -264,6 +322,10 @@ while(cap.isOpened()):
 		#display image
 		cv2.imshow('Thermal',heatmap)
 
+		#send the same picture to the virtual webcam
+		if vcam is not None:
+			vcam.send(cv2.cvtColor(fitToSize(heatmap, vcamWidth, vcamHeight), cv2.COLOR_BGR2RGB))
+
 		if recording == True:
 			elapsed = (time.time() - start)
 			elapsed = time.strftime("%H:%M:%S", time.gmtime(elapsed)) 
@@ -334,7 +396,12 @@ while(cap.isOpened()):
 			colormap += 1
 			if colormap == 11:
 				colormap = 0
-
+				
+		if keyPress == ord('j'): #m to cycle through color maps-
+			colormap -= 1
+			if colormap == 0:
+				colormap = 11
+		
 		if keyPress == ord('r') and recording == False: #r to start reording
 			videoOut = rec()
 			recording = True
@@ -351,3 +418,9 @@ while(cap.isOpened()):
 			capture.release()
 			cv2.destroyAllWindows()
 		
+
+#clean up
+cap.release()
+if vcam is not None:
+	vcam.close()
+cv2.destroyAllWindows()
